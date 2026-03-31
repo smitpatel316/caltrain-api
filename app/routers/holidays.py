@@ -6,6 +6,7 @@ Provides holiday service schedule information.
 
 from datetime import date
 from typing import Optional
+import re
 
 from fastapi import APIRouter, Query, Path
 
@@ -14,9 +15,24 @@ from app.services.holidays_service import holiday_service
 router = APIRouter(prefix="/api/v1", tags=["holidays"])
 
 
+# NOTE: /schedule/today must be defined BEFORE /schedule/{date_str}
+# to prevent "today" from being matched as a date parameter
+
+@router.get("/schedule/today")
+async def get_todays_schedule():
+    """Get today's schedule information."""
+    schedule_info = holiday_service.get_schedule_info()
+    return schedule_info
+
+
 @router.get("/schedule/{date_str}")
 async def get_schedule_for_date(
-    date_str: str = Path(..., description="Date in YYYY-MM-DD format"),
+    date_str: str = Path(
+        ...,
+        description="Date in YYYY-MM-DD format",
+        # Regex to match only date-like patterns, not "today" or other words
+        pattern=r"^\d{4}-\d{2}-\d{2}$"
+    ),
 ):
     """Get schedule information for a specific date.
 
@@ -26,7 +42,6 @@ async def get_schedule_for_date(
     try:
         check_date = date.fromisoformat(date_str)
         schedule_info = holiday_service.get_schedule_info(check_date)
-
         return schedule_info
 
     except ValueError:
@@ -34,14 +49,6 @@ async def get_schedule_for_date(
             "error": "Invalid date format",
             "message": "Use YYYY-MM-DD format (e.g., 2026-03-30)",
         }
-
-
-@router.get("/schedule/today")
-async def get_todays_schedule():
-    """Get today's schedule information."""
-    schedule_info = holiday_service.get_schedule_info()
-
-    return schedule_info
 
 
 @router.get("/holidays/upcoming")
@@ -53,7 +60,6 @@ async def get_upcoming_holidays(
     Returns holidays that fall within the specified number of days.
     """
     holidays = holiday_service.get_upcoming_holidays(days)
-
     return {
         "days_ahead": days,
         "holidays": holidays,

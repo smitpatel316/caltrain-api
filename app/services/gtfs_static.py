@@ -47,11 +47,14 @@ class GTFSStaticService:
 
     # Primary and fallback URLs for GTFS data
     GTFS_URL = "https://api.511.org/transit/datafeeds?api_key={key}&operator_id=RG"
-    CALTRANS_GTFS_URL = "https://transit.511.org/open-data/gtfs.zip"
+    CALTRANS_GTFS_URL = "https://511.org/open-data/gtfs.zip"
 
     # Cache TTL for stops and routes (1 hour)
     STOPS_CACHE_TTL = 3600
     ROUTES_CACHE_TTL = 3600
+
+    # Batch size for bulk inserts
+    BATCH_SIZE = 5000
 
     def __init__(self):
         """Initialize the GTFS static service."""
@@ -61,7 +64,6 @@ class GTFSStaticService:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         self.engine = create_engine(f"sqlite:///{self.db_path}")
-        self.Session = sessionmaker = None  # Not used with raw SQL
         self._last_refresh: Optional[str] = None
         self._refresh_in_progress = False
 
@@ -70,7 +72,7 @@ class GTFSStaticService:
             RateLimitConfig(requests_per_hour=settings.rate_limit_requests_per_hour)
         )
 
-    def _init_database(self) -> None:
+    def init_database(self) -> None:
         """Initialize SQLite database with GTFS tables.
 
         Creates all necessary tables and indexes if they don't exist.
@@ -156,6 +158,14 @@ class GTFSStaticService:
                     )
                 """))
 
+                # Metadata table for tracking refresh timestamps
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    )
+                """))
+
                 # Create indexes for performance
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stop_times_trip ON stop_times(trip_id)"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stop_times_stop ON stop_times(stop_id)"))
@@ -190,7 +200,7 @@ class GTFSStaticService:
             url = self.GTFS_URL.format(key=api_key)
 
             def make_request():
-                with httpx.Client(timeout=120.0) as client:
+                with httpx.Client(timeout=120.0, follow_redirects=True) as client:
                     response = client.get(url)
                     response.raise_for_status()
                     return response
@@ -203,7 +213,7 @@ class GTFSStaticService:
             with open(self.gtfs_zip_path, "wb") as f:
                 f.write(response.content)
 
-            logger.info(f"Downloaded GTFS data from 511.org API ({response.headers.get('content-length', 'unknown')} bytes)")
+            logger.info(f"Downloaded GTFS data from 511.org API ({len(response.content)} bytes)")
             return True
 
         except NetworkUnavailableError:
@@ -220,7 +230,7 @@ class GTFSStaticService:
             True if download successful, False otherwise
         """
         try:
-            with httpx.Client(timeout=180.0) as client:
+            with httpx.Client(timeout=180.0, follow_redirects=True) as client:
                 response = client.get(self.CALTRANS_GTFS_URL)
                 response.raise_for_status()
 
@@ -232,9 +242,7 @@ class GTFSStaticService:
 
         except Exception as e:
             logger.error(f"Failed to download Caltrans GTFS: {e}")
-            raise GTFSFetchError(
-                f"Failed to download GTFS from any source: {e}"
-            )
+            raise GTFSFetchError(f"Failed to download GTFS from any source: {e}") from e
 
     def _parse_gtfs(self) -> bool:
         """Parse GTFS zip and store in SQLite.
@@ -262,6 +270,8 @@ class GTFSStaticService:
             with zipfile.ZipFile(self.gtfs_zip_path, "r") as z:
                 z.extractall(extract_dir)
 
+            logger.info("Extracted GTFS zip, starting parse...")
+
             # Parse each GTFS file
             self._parse_agency(extract_dir)
             self._parse_stops(extract_dir)
@@ -271,6 +281,7 @@ class GTFSStaticService:
             self._parse_calendar(extract_dir)
 
             self._last_refresh = datetime.now(timezone.utc).isoformat()
+            self._save_refresh_timestamp()
             logger.info("GTFS data parsed and stored successfully")
             return True
 
@@ -279,6 +290,27 @@ class GTFSStaticService:
         except Exception as e:
             logger.error(f"Failed to parse GTFS: {e}")
             raise GTFSParseError(f"Failed to parse GTFS data: {e}") from e
+
+    def _bulk_insert(self, table: str, df: pd.DataFrame, if_exists: str = "append") -> None:
+        """Bulk insert DataFrame into SQLite table using chunked writes.
+
+        Args:
+            table: Table name
+            df: DataFrame to insert
+            if_exists: How to handle existing data ('append' or 'replace')
+        """
+        if df.empty:
+            return
+
+        # Use pandas to_sql with multi-row inserts for speed
+        df.to_sql(
+            table,
+            self.engine,
+            if_exists=if_exists,
+            index=False,
+            method="multi",
+            chunksize=self.BATCH_SIZE,
+        )
 
     def _parse_agency(self, extracted_dir: Path) -> None:
         """Parse agency.txt file.
@@ -293,22 +325,7 @@ class GTFSStaticService:
 
         try:
             df = pd.read_csv(agency_file)
-            with self.engine.connect() as conn:
-                for _, row in df.iterrows():
-                    conn.execute(
-                        text("""
-                            INSERT OR REPLACE INTO agency VALUES (:agency_id, :agency_name,
-                                :agency_url, :agency_timezone, :agency_lang)
-                        """),
-                        {
-                            "agency_id": row.get("agency_id"),
-                            "agency_name": row.get("agency_name"),
-                            "agency_url": row.get("agency_url"),
-                            "agency_timezone": row.get("agency_timezone"),
-                            "agency_lang": row.get("agency_lang"),
-                        },
-                    )
-                conn.commit()
+            self._bulk_insert("agency", df, if_exists="replace")
             logger.debug(f"Parsed {len(df)} agency records")
         except Exception as e:
             logger.warning(f"Failed to parse agency.txt: {e}")
@@ -325,27 +342,9 @@ class GTFSStaticService:
 
         try:
             df = pd.read_csv(stops_file)
-            with self.engine.connect() as conn:
-                # Clear existing data
-                conn.execute(text("DELETE FROM stops"))
-
-                for _, row in df.iterrows():
-                    conn.execute(
-                        text("""
-                            INSERT OR REPLACE INTO stops VALUES (:stop_id, :stop_name,
-                                :stop_lat, :stop_lon, :zone_id, :location_type, :parent_station)
-                        """),
-                        {
-                            "stop_id": row["stop_id"],
-                            "stop_name": row["stop_name"],
-                            "stop_lat": row["stop_lat"],
-                            "stop_lon": row["stop_lon"],
-                            "zone_id": row.get("zone_id"),
-                            "location_type": row.get("location_type", 0),
-                            "parent_station": row.get("parent_station"),
-                        },
-                    )
-                conn.commit()
+            # Ensure columns match table schema
+            df = df[[c for c in ["stop_id", "stop_name", "stop_lat", "stop_lon", "zone_id", "location_type", "parent_station"] if c in df.columns]]
+            self._bulk_insert("stops", df, if_exists="replace")
             logger.info(f"Parsed {len(df)} stops")
         except Exception as e:
             raise GTFSParseError(f"Failed to parse stops.txt: {e}", file_name="stops.txt") from e
@@ -362,26 +361,9 @@ class GTFSStaticService:
 
         try:
             df = pd.read_csv(routes_file)
-            with self.engine.connect() as conn:
-                conn.execute(text("DELETE FROM routes"))
-
-                for _, row in df.iterrows():
-                    conn.execute(
-                        text("""
-                            INSERT OR REPLACE INTO routes VALUES (:route_id, :route_short_name,
-                                :route_long_name, :route_type, :route_color, :route_text_color, :agency_id)
-                        """),
-                        {
-                            "route_id": row["route_id"],
-                            "route_short_name": row.get("route_short_name"),
-                            "route_long_name": row.get("route_long_name"),
-                            "route_type": row.get("route_type"),
-                            "route_color": row.get("route_color"),
-                            "route_text_color": row.get("route_text_color"),
-                            "agency_id": row.get("agency_id"),
-                        },
-                    )
-                conn.commit()
+            cols = ["route_id", "route_short_name", "route_long_name", "route_type", "route_color", "route_text_color", "agency_id"]
+            df = df[[c for c in cols if c in df.columns]]
+            self._bulk_insert("routes", df, if_exists="replace")
             logger.info(f"Parsed {len(df)} routes")
         except Exception as e:
             raise GTFSParseError(f"Failed to parse routes.txt: {e}", file_name="routes.txt") from e
@@ -398,25 +380,11 @@ class GTFSStaticService:
 
         try:
             df = pd.read_csv(trips_file)
-            with self.engine.connect() as conn:
-                conn.execute(text("DELETE FROM trips"))
-
-                for _, row in df.iterrows():
-                    conn.execute(
-                        text("""
-                            INSERT OR REPLACE INTO trips VALUES (:trip_id, :route_id,
-                                :service_id, :trip_headsign, :direction_id, :block_id)
-                        """),
-                        {
-                            "trip_id": row["trip_id"],
-                            "route_id": row["route_id"],
-                            "service_id": row["service_id"],
-                            "trip_headsign": row.get("trip_headsign"),
-                            "direction_id": int(row.get("direction_id", 0)),
-                            "block_id": row.get("block_id"),
-                        },
-                    )
-                conn.commit()
+            cols = ["trip_id", "route_id", "service_id", "trip_headsign", "direction_id", "block_id"]
+            df = df[[c for c in cols if c in df.columns]]
+            # Fill NaN values appropriately
+            df = df.fillna({"direction_id": 0})
+            self._bulk_insert("trips", df, if_exists="replace")
             logger.info(f"Parsed {len(df)} trips")
         except Exception as e:
             raise GTFSParseError(f"Failed to parse trips.txt: {e}", file_name="trips.txt") from e
@@ -432,32 +400,30 @@ class GTFSStaticService:
             raise GTFSParseError("stop_times.txt not found in GTFS feed", file_name="stop_times.txt")
 
         try:
-            df = pd.read_csv(stop_times_file)
-            with self.engine.connect() as conn:
-                conn.execute(text("DELETE FROM stop_times"))
+            # Read entire file with specified dtypes to avoid dtype warnings
+            # This is faster than chunked reading for the final insert
+            dtypes = {
+                "trip_id": str,
+                "stop_id": str,
+                "arrival_time": str,
+                "departure_time": str,
+                "stop_sequence": int,
+                "pickup_type": str,
+                "drop_off_type": str,
+            }
 
-                for _, row in df.iterrows():
-                    conn.execute(
-                        text("""
-                            INSERT INTO stop_times (trip_id, stop_id, arrival_time, departure_time,
-                                stop_sequence, pickup_type, drop_off_type)
-                            VALUES (:trip_id, :stop_id, :arrival_time, :departure_time,
-                                :stop_sequence, :pickup_type, :drop_off_type)
-                        """),
-                        {
-                            "trip_id": row["trip_id"],
-                            "stop_id": row["stop_id"],
-                            "arrival_time": row.get("arrival_time"),
-                            "departure_time": row.get("departure_time"),
-                            "stop_sequence": row["stop_sequence"],
-                            "pickup_type": row.get("pickup_type"),
-                            "drop_off_type": row.get("drop_off_type"),
-                        },
-                    )
-                conn.commit()
-            logger.info(f"Parsed {len(df)} stop times")
+            df = pd.read_csv(stop_times_file, dtype=dtypes, low_memory=False)
+            cols = ["trip_id", "stop_id", "arrival_time", "departure_time", "stop_sequence", "pickup_type", "drop_off_type"]
+            df = df[[c for c in cols if c in df.columns]]
+
+            logger.info(f"Read {len(df)} stop_times rows, starting insert...")
+
+            # Bulk insert
+            self._bulk_insert("stop_times", df, if_exists="append")
+            logger.info(f"Parsed {len(df)} stop_times total")
+
         except Exception as e:
-            raise GTFSParseError(f"Failed to parse stop_times.txt: {e}", file_name="stop_times.txt") from e
+            raise GTFSParseError(f"Failed to parse stop_times.txt: {e}") from e
 
     def _parse_calendar(self, extracted_dir: Path) -> None:
         """Parse calendar.txt and calendar_dates.txt files.
@@ -485,30 +451,7 @@ class GTFSStaticService:
         """
         try:
             df = pd.read_csv(calendar_file)
-            with self.engine.connect() as conn:
-                conn.execute(text("DELETE FROM calendar"))
-
-                for _, row in df.iterrows():
-                    conn.execute(
-                        text("""
-                            INSERT OR REPLACE INTO calendar VALUES (:service_id, :monday,
-                                :tuesday, :wednesday, :thursday, :friday, :saturday, :sunday,
-                                :start_date, :end_date)
-                        """),
-                        {
-                            "service_id": row["service_id"],
-                            "monday": int(row["monday"]),
-                            "tuesday": int(row["tuesday"]),
-                            "wednesday": int(row["wednesday"]),
-                            "thursday": int(row["thursday"]),
-                            "friday": int(row["friday"]),
-                            "saturday": int(row["saturday"]),
-                            "sunday": int(row["sunday"]),
-                            "start_date": row["start_date"],
-                            "end_date": row["end_date"],
-                        },
-                    )
-                conn.commit()
+            self._bulk_insert("calendar", df, if_exists="replace")
             logger.info(f"Parsed {len(df)} calendar entries")
         except Exception as e:
             logger.warning(f"Failed to parse calendar.txt: {e}")
@@ -521,18 +464,7 @@ class GTFSStaticService:
         """
         try:
             df = pd.read_csv(calendar_dates_file)
-            with self.engine.connect() as conn:
-                for _, row in df.iterrows():
-                    conn.execute(
-                        text("""
-                            INSERT OR REPLACE INTO calendar VALUES (:service_id, 0, 0, 0, 0, 0, 0, 0, :date, :date)
-                        """),
-                        {
-                            "service_id": row["service_id"],
-                            "date": str(row["date"]),
-                        },
-                    )
-                conn.commit()
+            self._bulk_insert("calendar", df, if_exists="append")
             logger.info(f"Parsed {len(df)} calendar date exceptions")
         except Exception as e:
             logger.warning(f"Failed to parse calendar_dates.txt: {e}")
@@ -552,7 +484,7 @@ class GTFSStaticService:
         self._refresh_in_progress = True
 
         try:
-            self._init_database()
+            self.init_database()
 
             if not self._download_gtfs():
                 return False
@@ -580,7 +512,7 @@ class GTFSStaticService:
 
         try:
             with self.engine.connect() as conn:
-                result = conn.execute(text("SELECT * FROM stops ORDER BY stop_name"))
+                result = conn.execute(text("SELECT * FROM stops WHERE stop_name IS NOT NULL ORDER BY stop_name"))
                 rows = result.fetchall()
 
             stops = [
@@ -843,7 +775,50 @@ class GTFSStaticService:
         Returns:
             ISO timestamp or None if never refreshed
         """
-        return self._last_refresh
+        if self._last_refresh:
+            return self._last_refresh
+        # Try to load from database if not set in memory
+        return self._load_refresh_timestamp()
+
+    def _save_refresh_timestamp(self) -> None:
+        """Save the current refresh timestamp to the database."""
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(
+                    text("INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_refresh', :value)"),
+                    {"value": self._last_refresh}
+                )
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to save refresh timestamp: {e}")
+
+    def _load_refresh_timestamp(self) -> Optional[str]:
+        """Load the refresh timestamp from the database.
+
+        If no timestamp is stored (e.g., pre-existing data), falls back to
+        the database file modification time as an estimate.
+        """
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(text("SELECT value FROM metadata WHERE key = 'last_refresh'"))
+                row = result.fetchone()
+                if row:
+                    self._last_refresh = row[0]
+                    return self._last_refresh
+        except Exception as e:
+            logger.warning(f"Failed to load refresh timestamp: {e}")
+
+        # Fallback: use database file modification time as estimate
+        try:
+            db_path = Path(self.db_path)
+            if db_path.exists():
+                mtime = datetime.fromtimestamp(db_path.stat().st_mtime, tz=timezone.utc)
+                self._last_refresh = mtime.isoformat()
+                return self._last_refresh
+        except Exception:
+            pass
+
+        return None
 
     def is_data_loaded(self) -> bool:
         """Check if GTFS data is loaded in the database.

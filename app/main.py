@@ -1,4 +1,5 @@
 import logging
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
@@ -47,12 +48,23 @@ async def lifespan(app: FastAPI):
     for warning in config_warnings:
         logger.warning(f"Config: {warning}")
 
-    # Initialize and refresh GTFS static data
-    try:
-        gtfs_static.refresh()
-        logger.info("Initial GTFS static data loaded")
-    except Exception as e:
-        logger.warning(f"Initial GTFS load failed (will retry in background): {e}")
+    # Start GTFS refresh in background thread so server starts immediately
+    def background_refresh():
+        try:
+            if gtfs_static.is_data_loaded():
+                logger.info("GTFS data already loaded, skipping initial refresh")
+                # Ensure tables exist (e.g., metadata table added in later versions)
+                gtfs_static.init_database()
+            else:
+                logger.info("Starting background GTFS refresh...")
+                gtfs_static.refresh()
+                logger.info("Background GTFS refresh completed")
+        except Exception as e:
+            logger.warning(f"Background GTFS refresh failed: {e}")
+
+    refresh_thread = threading.Thread(target=background_refresh, daemon=True)
+    refresh_thread.start()
+    logger.info("GTFS refresh started in background")
 
     # Start background scheduler for periodic refresh
     start_scheduler()
